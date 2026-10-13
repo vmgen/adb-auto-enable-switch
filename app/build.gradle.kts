@@ -5,6 +5,7 @@ plugins {
 android {
     namespace = "com.tpn.adbautoenable"
     compileSdk = 35
+	base.archivesName.set("adb-auto-enable-switch-app")
 
     defaultConfig {
         applicationId = "com.tpn.adbautoenable"
