@@ -146,7 +146,6 @@ public class WebServer extends NanoHTTPD {
 
             if (credentialsChanged) {
                 // 凭证变了，返回 401，浏览器立刻弹登录框
-                // 此时 prefs 里已是新凭证，用户输入新凭证即可登录
                 Log.i(TAG, "Web API: credentials changed, requesting re-auth");
                 Response resp = newFixedLengthResponse(
                         Response.Status.UNAUTHORIZED, "text/plain",
@@ -304,10 +303,20 @@ public class WebServer extends NanoHTTPD {
         int adbExpiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
         String webUsername = prefs.getString("web_username", "admin");
 
+        // 计算 ADB 剩余时间（分钟）
+        long adbRemainingMinutes = -1;
+        if (adbEnabled) {
+            long enabledAt = prefs.getLong("adb_enabled_at", 0);
+            if (enabledAt > 0) {
+                long elapsed = (System.currentTimeMillis() - enabledAt) / 60000;
+                adbRemainingMinutes = Math.max(0, adbExpiryMinutes - elapsed);
+            }
+        }
+
         String json = String.format(Locale.US,
-                "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b,\"adbEnabled\":%b,\"adbExpiryMinutes\":%d,\"webUsername\":\"%s\"}",
+                "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b,\"adbEnabled\":%b,\"adbExpiryMinutes\":%d,\"webUsername\":\"%s\",\"adbRemainingMinutes\":%d}",
                 lastStatus, currentPort, isPaired, adbTargetAvailable, targetPort, webServerEnabled,
-                adbEnabled, adbExpiryMinutes, webUsername
+                adbEnabled, adbExpiryMinutes, webUsername, adbRemainingMinutes
         );
         Log.d(TAG, "handleStatus() completed");
         return newFixedLengthResponse(Response.Status.OK, "application/json", json);
@@ -702,6 +711,10 @@ public class WebServer extends NanoHTTPD {
                 "                <div class=\"status-label\">Current Port:</div>\n" +
                 "                <div class=\"status-value\" id=\"current-port\">Loading...</div>\n" +
                 "            </div>\n" +
+                "            <div class=\"status-row\">\n" +
+                "                <div class=\"status-label\">ADB 剩余时间:</div>\n" +
+                "                <div class=\"status-value\" id=\"adb-remaining\">Loading...</div>\n" +
+                "            </div>\n" +
                 "        </div>\n" +
                 "        <button onclick=\"refreshStatus()\">🔄 Refresh Status</button>\n" +
                 "    </div>\n" +
@@ -806,6 +819,21 @@ public class WebServer extends NanoHTTPD {
                 "            textEl.textContent = text;\n" +
                 "        }\n" +
                 "        \n" +
+                "        // 将剩余分钟数格式化为易读形式\n" +
+                "        function formatRemaining(minutes) {\n" +
+                "            if (minutes < 0) return 'N/A';\n" +
+                "            if (minutes === 0) return 'Expired';\n" +
+                "            if (minutes < 60) return minutes + ' 分钟';\n" +
+                "            if (minutes < 1440) {\n" +
+                "                const h = Math.floor(minutes / 60);\n" +
+                "                const m = minutes % 60;\n" +
+                "                return m === 0 ? h + ' 小时' : h + ' 小时 ' + m + ' 分钟';\n" +
+                "            }\n" +
+                "            const d = Math.floor(minutes / 1440);\n" +
+                "            const h = Math.floor((minutes % 1440) / 60);\n" +
+                "            return h === 0 ? d + ' 天' : d + ' 天 ' + h + ' 小时';\n" +
+                "        }\n" +
+                "        \n" +
                 "        // 只在页面首次加载时回填配置输入框，之后不再覆盖用户编辑\n" +
                 "        function loadInitialConfig() {\n" +
                 "            fetch('/api/status')\n" +
@@ -823,7 +851,7 @@ public class WebServer extends NanoHTTPD {
                 "                    const webUsernameInput = document.getElementById('web-username-input');\n" +
                 "                    if (webUsernameInput) webUsernameInput.value = data.webUsername;\n" +
                 "                    \n" +
-                "                    // 密码框不回填，保持为空，placeholder 提示留空表示不修改\n" +
+                "                    // 密码框不回填，保持为空\n" +
                 "                });\n" +
                 "        }\n" +
                 "        \n" +
@@ -840,6 +868,7 @@ public class WebServer extends NanoHTTPD {
                 "                        '<span class=\"status bad\">✗ Not available</span>';\n" +
                 "                    document.getElementById('last-status').textContent = data.lastStatus;\n" +
                 "                    document.getElementById('current-port').textContent = (data.currentPort === -1) ? 'NONE' : data.currentPort;\n" +
+                "                    document.getElementById('adb-remaining').textContent = formatRemaining(data.adbRemainingMinutes);\n" +
                 "                    \n" +
                 "                    if (data.isPaired) {\n" +
                 "                        document.getElementById('pairing-card').style.display = 'none';\n" +

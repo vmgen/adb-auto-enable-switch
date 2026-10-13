@@ -1,6 +1,6 @@
 # ADB Auto-Enable 编译与安装流程及功能修改
 
-**版本号：v2026.10.13.19**
+**版本号：v2026.10.13.20**
 
 ## 一、开发流程
 
@@ -219,11 +219,23 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 - 整页一个表单，底部一个统一“保存”按钮，一次 POST 提交，写入存储。
 - 保存后立即生效。
 
+### 功能 4：System Status 显示 ADB 剩余时间
+
+- System Status 区块增加一行“ADB 剩余时间”。
+- 数据来源：`/api/status` 返回 `adbRemainingMinutes`（数值，单位分钟）。
+- 前端转换为易读格式：
+  - 未启用或无起始时间戳：`N/A`
+  - 已过期：`Expired`
+  - 不足 1 小时：`X 分钟`
+  - 1 小时以上：`X 小时 Y 分钟`（Y=0 时显示 `X 小时`）
+  - 超过 24 小时：`X 天 Y 小时`（Y=0 时显示 `X 天`）
+- 属于只读状态，由 `refreshStatus()` 每 5 秒刷新。
+
 ## 三、Web 页面结构
 
 ### 现有区块（保留）
 
-- **System Status**：配对状态、端口状态、设备 IP、上次启动状态、当前端口
+- **System Status**：配对状态、端口状态、设备 IP、上次启动状态、当前端口、ADB 剩余时间
 - **Initial Pairing**：配对码、配对端口 + “Pair Device”按钮
 - **Device Paired**：已配对时显示，“Reset Pairing”按钮
 - **Target Port Configuration**：目标端口输入 + “Save Port” / “Save & Switch”
@@ -244,7 +256,7 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 │  密码:   [placeholder]       │
 │           [ 💾 保存 ]        │
 ├─────────────────────────────┤
-│ 📊 System Status             │  ← 保留原有
+│ 📊 System Status             │  ← 保留原有，新增 ADB 剩余时间
 ├─────────────────────────────┤
 │ 🔐 Initial Pairing           │  ← 保留原有
 ├─────────────────────────────┤
@@ -267,8 +279,9 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 | 函数 | 职责 | 频率 |
 |------|------|------|
 | `loadInitialConfig()` | 回填配置输入框初值（ADB启用、ADB超时时间、用户名、targetPort） | 页面加载时一次 |
-| `refreshStatus()` | 刷新 System Status 只读字段 | 每 5 秒 |
+| `refreshStatus()` | 刷新 System Status 只读字段（含 ADB 剩余时间） | 每 5 秒 |
 | `refreshLogs()` | 刷新日志区 | 每 3 秒 |
+| `formatRemaining()` | 把剩余分钟数转成易读格式 | 按需调用 |
 
 配置输入框只在页面加载时回填一次，`refreshStatus()` 不碰配置输入框，避免覆盖用户正在编辑的内容。
 
@@ -292,508 +305,14 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 
 ## 五、需要修改的代码文件
 
-### 1. WebServer.java
-
-**文件路径**：`app/src/main/java/com/tpn/adbautoenable/WebServer.java`
-
-#### 改动 1：新增 import
-
-```java
-import android.content.Intent;
-import java.util.Base64;
-```
-
-#### 改动 2：serve() 入口加认证 + 路由
-
-```java
-@Override
-public Response serve(IHTTPSession session) {
-    String uri = session.getUri();
-    Method method = session.getMethod();
-
-    // ---- HTTP Basic Auth ----
-    String authHeader = session.getHeaders().get("authorization");
-    if (!isAuthorized(authHeader)) {
-        Response resp = newFixedLengthResponse(
-                Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized");
-        resp.addHeader("WWW-Authenticate", "Basic realm=\"ADB Auto-Enable\"");
-        return resp;
-    }
-
-    if (uri.equals("/api/settings") && method == Method.POST) {
-        return handleSaveSettings(session);
-    } else if (uri.equals("/api/pair") && method == Method.POST) {
-        return handlePairing(session);
-    } else if (uri.equals("/api/status")) {
-        return handleStatus();
-    } else if (uri.equals("/api/test")) {
-        return handleTest();
-    } else if (uri.equals("/api/switch")) {
-        return handleSwitch();
-    } else if (uri.equals("/api/port") && method == Method.POST) {
-        return handleSetPort(session);
-    } else if (uri.equals("/api/logs")) {
-        return handleLogs();
-    } else if (uri.equals("/api/reset") && method == Method.POST) {
-        return handleReset();
-    } else if (uri.equals("/api/webserver") && method == Method.POST) {
-        return handleToggleWebServer(session);
-    } else {
-        return newFixedLengthResponse(getHTML());
-    }
-}
-```
-
-#### 改动 3：新增认证与保存设置方法
-
-```java
-private boolean isAuthorized(String authHeader) {
-    if (authHeader == null || !authHeader.startsWith("Basic ")) {
-        return false;
-    }
-    try {
-        String decoded = new String(Base64.getDecoder().decode(authHeader.substring(6)));
-        String[] parts = decoded.split(":", 2);
-        if (parts.length != 2) return false;
-
-        SharedPreferences prefs = getPrefs();
-        String user = prefs.getString("web_username", "admin");
-        String pass = prefs.getString("web_password", "admin");
-        return parts[0].equals(user) && parts[1].equals(pass);
-    } catch (Exception e) {
-        Log.e(TAG, "Auth decode error", e);
-        return false;
-    }
-}
-
-private Response handleSaveSettings(IHTTPSession session) {
-    try {
-        Map<String, String> files = new HashMap<>();
-        session.parseBody(files);
-        Map<String, List<String>> params = session.getParameters();
-
-        SharedPreferences prefs = getPrefs();
-
-        // 写之前先记录旧凭证，用于判断是否变化
-        String oldUsername = prefs.getString("web_username", "admin");
-        String oldPassword = prefs.getString("web_password", "admin");
-
-        SharedPreferences.Editor editor = prefs.edit();
-
-        editor.putBoolean("adb_enabled", params.containsKey("adb_enabled"));
-
-        List<String> expList = params.get("adb_expiry_minutes");
-        if (expList != null && !expList.isEmpty()) {
-            try {
-                int m = Integer.parseInt(expList.get(0));
-                editor.putInt("adb_expiry_minutes", Math.max(1, Math.min(4320, m)));
-            } catch (NumberFormatException ignored) {}
-        }
-
-        List<String> userList = params.get("web_username");
-        if (userList != null && !userList.isEmpty() && !userList.get(0).isEmpty()) {
-            editor.putString("web_username", userList.get(0));
-        }
-
-        List<String> passList = params.get("web_password");
-        if (passList != null && !passList.isEmpty() && !passList.get(0).isEmpty()) {
-            editor.putString("web_password", passList.get(0));
-        }
-
-        editor.apply();
-        Log.i(TAG, "Web API: settings saved");
-
-        // 保存后立即刷新 adbd 状态，并重新计时
-        Intent intent = new Intent(context, AdbConfigService.class);
-        intent.putExtra("refresh_adb", true);
-        context.startForegroundService(intent);
-
-        // 判断凭证是否变化
-        String newUsername = prefs.getString("web_username", "admin");
-        String newPassword = prefs.getString("web_password", "admin");
-        boolean credentialsChanged =
-                !oldUsername.equals(newUsername) || !oldPassword.equals(newPassword);
-
-        if (credentialsChanged) {
-            // 凭证变了，返回 401，浏览器立刻弹登录框
-            Log.i(TAG, "Web API: credentials changed, requesting re-auth");
-            Response resp = newFixedLengthResponse(
-                    Response.Status.UNAUTHORIZED, "text/plain",
-                    "凭证已修改，请重新登录");
-            resp.addHeader("WWW-Authenticate", "Basic realm=\"ADB Auto-Enable\"");
-            return resp;
-        }
-
-        // 凭证没变，正常跳回首页
-        Response resp = newFixedLengthResponse(
-                Response.Status.REDIRECT, "text/plain", "");
-        resp.addHeader("Location", "/");
-        return resp;
-    } catch (Exception e) {
-        Log.e(TAG, "Web API: save settings error", e);
-        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR,
-                "application/json", "{\"error\":\"" + e.getMessage() + "\"}");
-    }
-}
-```
-
-#### 改动 4：状态 JSON 增加新字段（不含密码）
-
-```java
-boolean adbEnabled = prefs.getBoolean("adb_enabled", true);
-int adbExpiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
-String webUsername = prefs.getString("web_username", "admin");
-
-String json = String.format(Locale.US,
-        "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b,\"adbEnabled\":%b,\"adbExpiryMinutes\":%d,\"webUsername\":\"%s\"}",
-        lastStatus, currentPort, isPaired, adbTargetAvailable, targetPort, webServerEnabled,
-        adbEnabled, adbExpiryMinutes, webUsername
-);
-```
-
-#### 改动 5：HTML 顶部加设置区块
-
-在 `<h1>🔧 ADB Auto-Enable Configuration</h1>` 之后、第一个 `<div class="card">` 之前插入：
-
-```java
-"    <h1>🔧 ADB Auto-Enable Configuration</h1>\n" +
-"    \n" +
-"    <div class=\"card\">\n" +
-"        <h2>⚙️ ADB 设置</h2>\n" +
-"        <form method=\"POST\" action=\"/api/settings\">\n" +
-"            <label><input type=\"checkbox\" id=\"adb-enabled-input\" name=\"adb_enabled\" /> ADB启用</label><br><br>\n" +
-"            <label>ADB超时时间（分钟）: <input type=\"number\" id=\"adb-expiry-input\" name=\"adb_expiry_minutes\" min=\"1\" max=\"4320\" /></label><br>\n" +
-"            <small style=\"font-size:12px;color:#888;\">最大 4320（3 天）</small><br><br>\n" +
-"            <label>用户名: <input type=\"text\" id=\"web-username-input\" name=\"web_username\" /></label><br><br>\n" +
-"            <label>密码: <input type=\"password\" id=\"web-password-input\" name=\"web_password\" placeholder=\"留空表示不修改\" /></label><br><br>\n" +
-"            <button type=\"submit\">💾 保存</button>\n" +
-"        </form>\n" +
-"    </div>\n" +
-"    \n" +
-"    <div class=\"card\">\n" +
-"        <h2>📊 System Status</h2>\n" +
-```
-
-#### 改动 6：前端新增 loadInitialConfig()，refreshStatus() 只负责 System Status
-
-```javascript
-// 只在页面首次加载时回填配置输入框，之后不再覆盖用户编辑
-function loadInitialConfig() {
-    fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-            const portInput = document.getElementById('target-port-input');
-            if (portInput) portInput.value = data.targetPort;
-
-            const adbEnabledInput = document.getElementById('adb-enabled-input');
-            if (adbEnabledInput) adbEnabledInput.checked = data.adbEnabled;
-
-            const adbExpiryInput = document.getElementById('adb-expiry-input');
-            if (adbExpiryInput) adbExpiryInput.value = data.adbExpiryMinutes;
-
-            const webUsernameInput = document.getElementById('web-username-input');
-            if (webUsernameInput) webUsernameInput.value = data.webUsername;
-
-            // 密码框不回填，保持为空
-        });
-}
-
-// refreshStatus 只负责 System Status 只读区域
-function refreshStatus() {
-    fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-            document.getElementById('pairing-status').innerHTML = data.isPaired ?
-                '<span class="status good">✓ Paired</span>' :
-                '<span class="status bad">✗ Not paired</span>';
-            document.getElementById('port-status').innerHTML = data.adb5555Available ?
-                '<span class="status good">✓ Available</span>' :
-                '<span class="status bad">✗ Not available</span>';
-            document.getElementById('last-status').textContent = data.lastStatus;
-            document.getElementById('current-port').textContent = (data.currentPort === -1) ? 'NONE' : data.currentPort;
-
-            if (data.isPaired) {
-                document.getElementById('pairing-card').style.display = 'none';
-                document.getElementById('paired-card').style.display = 'block';
-            } else {
-                document.getElementById('pairing-card').style.display = 'block';
-                document.getElementById('paired-card').style.display = 'none';
-            }
-
-            if (data.adb5555Available) {
-                document.getElementById('switch-card').style.display = 'none';
-            } else {
-                document.getElementById('switch-card').style.display = 'block';
-            }
-        });
-}
-```
-
-初始化处调用：
-
-```javascript
-loadInitialConfig();
-refreshStatus();
-refreshLogs();
-
-setInterval(refreshStatus, 5000);
-startLogsAutoRefresh();
-```
-
-### 2. AdbConfigService.java
-
-**文件路径**：`app/src/main/java/com/tpn/adbautoenable/AdbConfigService.java`
-
-#### 改动 1：新增字段与常量
-
-```java
-private static final long EXPIRY_CHECK_INTERVAL_MS = 60000;  // 每分钟检查一次
-private volatile boolean expiryMonitorRunning = false;
-```
-
-#### 改动 2：新增 shouldEnableAdb()
-
-```java
-private boolean shouldEnableAdb() {
-    SharedPreferences prefs = getPrefs();
-
-    if (!prefs.getBoolean("adb_enabled", true)) {
-        return false;
-    }
-
-    long enabledAt = prefs.getLong("adb_enabled_at", 0);
-    if (enabledAt > 0) {
-        int expiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
-        long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
-        if (elapsedMinutes >= expiryMinutes) {
-            return false;
-        }
-    }
-    return true;
-}
-```
-
-#### 改动 3：enableWirelessDebuggingImmediately() 改为无参，按状态跃迁刷新
-
-```java
-private void enableWirelessDebuggingImmediately() {
-    try {
-        if (!shouldEnableAdb()) {
-            Log.i(TAG, "ADB disabled or expired, setting adb_wifi_enabled=0");
-            Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
-            return;
-        }
-
-        // 读当前 adb_wifi_enabled，判断是否从"没启动"变成"启动"
-        int currentAdbWifi = Settings.Global.getInt(
-                getContentResolver(), "adb_wifi_enabled", 0);
-
-        Log.i(TAG, "Enabling wireless debugging & disabling key revocation...");
-        Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
-        Settings.Global.putLong(getContentResolver(), "adb_allowed_connection_time", 0L);
-
-        // 只有从没启动变成启动时，才刷新起始时间戳
-        SharedPreferences prefs = getPrefs();
-        long enabledAt = prefs.getLong("adb_enabled_at", 0);
-        if (currentAdbWifi == 0 || enabledAt == 0) {
-            prefs.edit()
-                    .putLong("adb_enabled_at", System.currentTimeMillis())
-                    .apply();
-            Log.i(TAG, "adb_enabled_at refreshed (adb_wifi_enabled "
-                    + currentAdbWifi + " -> 1)");
-        } else {
-            long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
-            Log.i(TAG, "adb_enabled_at unchanged (adb already enabled, elapsed "
-                    + elapsedMinutes + " min)");
-        }
-    } catch (SecurityException e) {
-        Log.e(TAG, "Settings write failed - WRITE_SECURE_SETTINGS missing", e);
-    } catch (Exception e) {
-        Log.e(TAG, "Settings write unexpected error", e);
-    }
-}
-```
-
-#### 改动 4：新增 startExpiryMonitor()
-
-```java
-// ADB 超时监控：每分钟检查一次，过期后主动关闭无线调试
-private void startExpiryMonitor() {
-    if (expiryMonitorRunning) {
-        Log.i(TAG, "Expiry monitor already running");
-        return;
-    }
-    expiryMonitorRunning = true;
-
-    new Thread(() -> {
-        try {
-            Log.i(TAG, "Expiry monitor started");
-            while (true) {
-                Thread.sleep(EXPIRY_CHECK_INTERVAL_MS);
-
-                SharedPreferences prefs = getPrefs();
-                if (!prefs.getBoolean("adb_enabled", true)) {
-                    Log.i(TAG, "Expiry monitor: adb_enabled=false, stopping monitor");
-                    break;
-                }
-
-                long enabledAt = prefs.getLong("adb_enabled_at", 0);
-                if (enabledAt == 0) {
-                    Log.i(TAG, "Expiry monitor: no start timestamp, stopping monitor");
-                    break;
-                }
-
-                int expiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
-                long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
-
-                if (elapsedMinutes >= expiryMinutes) {
-                    Log.i(TAG, "Expiry monitor: expired ("
-                            + elapsedMinutes + " >= " + expiryMinutes
-                            + "), disabling wireless debugging");
-                    Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
-                    updateStatus("Expired - ADB disabled");
-                    break;
-                }
-            }
-        } catch (InterruptedException e) {
-            Log.e(TAG, "Expiry monitor interrupted", e);
-        } catch (Exception e) {
-            Log.e(TAG, "Expiry monitor error", e);
-        } finally {
-            expiryMonitorRunning = false;
-            Log.i(TAG, "Expiry monitor stopped");
-        }
-    }, "adb-expiry-monitor").start();
-}
-```
-
-#### 改动 5：onStartCommand() 调用点调整
-
-```java
-ensureTclAutostartProtectionAsync();
-
-boolean refreshAdb = intent != null && intent.getBooleanExtra("refresh_adb", false);
-
-// 启用/禁用 adbd，内部按状态跃迁判断是否刷新 adb_enabled_at
-enableWirelessDebuggingImmediately();
-
-// 启用状态下启动超时监控线程
-if (shouldEnableAdb()) {
-    startExpiryMonitor();
-}
-
-// 用户保存设置触发启用后，异步切换 adbd 到 targetPort，确保端口真正可用
-if (refreshAdb && shouldEnableAdb()) {
-    switchToTargetPortAsync();
-}
-```
-
-#### 改动 6：新增 switchToTargetPortAsync()
-
-```java
-// 用户保存设置触发启用后，异步发现 adbd 当前随机端口并切换到 targetPort
-private void switchToTargetPortAsync() {
-    new Thread(() -> {
-        try {
-            Log.i(TAG, "Post-enable: waiting for adbd to start...");
-            Thread.sleep(5000);  // 等 adbd 在随机端口启动
-
-            if (!shouldEnableAdb()) {
-                Log.i(TAG, "Post-enable: ADB no longer enabled, aborting port switch");
-                return;
-            }
-
-            Log.i(TAG, "Post-enable: discovering current ADB port...");
-            int port = discoverAdbPortViaMdns();
-            if (port == -1) {
-                Log.i(TAG, "Post-enable: mDNS failed, scanning ports...");
-                port = scanForAdbPort();
-            }
-
-            if (port == -1) {
-                Log.e(TAG, "Post-enable: could not find ADB port");
-                updateStatus("Failed - port not found after enable");
-                return;
-            }
-
-            Log.i(TAG, "Post-enable: found ADB on port " + port);
-
-            int targetPort = getTargetPort();
-            if (port == targetPort) {
-                Log.i(TAG, "Post-enable: already on target port " + targetPort);
-                updateStatus("Success - ADB on port " + targetPort);
-                return;
-            }
-
-            Log.i(TAG, "Post-enable: switching to target port " + targetPort + "...");
-            AdbHelper adbHelper = new AdbHelper(this);
-            String deviceIP = getDeviceIP();
-
-            boolean success = adbHelper.switchToPort("127.0.0.1", port, targetPort);
-            if (!success && !deviceIP.equals("127.0.0.1")) {
-                Log.i(TAG, "Post-enable: switch failed via loopback, retrying via " + deviceIP);
-                success = adbHelper.switchToPort(deviceIP, port, targetPort);
-            }
-
-            if (success) {
-                Log.i(TAG, "Post-enable: switched to port " + targetPort);
-                updateStatus("Success - ADB on port " + targetPort);
-            } else {
-                Log.e(TAG, "Post-enable: failed to switch to port " + targetPort);
-                updateStatus("Failed - could not switch port after enable");
-            }
-        } catch (InterruptedException e) {
-            Log.e(TAG, "Post-enable: interrupted", e);
-        } catch (Exception e) {
-            Log.e(TAG, "Post-enable: unexpected error", e);
-        }
-    }, "post-enable-port-switch").start();
-}
-```
-
-#### 改动 7：configureAdb() 加判断
-
-```java
-private boolean configureAdb() {
-    try {
-        if (!shouldEnableAdb()) {
-            Log.i(TAG, "ADB disabled or expired, skipping configureAdb");
-            Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
-            updateStatus("ADB disabled or expired");
-            return false;
-        }
-
-        // Re-assert wireless debugging & auto-revocation settings
-        Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
-        Settings.Global.putLong(getContentResolver(), "adb_allowed_connection_time", 0L);
-
-        // 原有逻辑...
-    }
-}
-```
-
-### 3. build.gradle.kts
-
-**文件路径**：`app/build.gradle.kts`
-
-修改 `versionCode` 默认值：
-
-```kotlin
-versionCode = (project.findProperty("CI_VERSION_CODE") as? String)?.toIntOrNull() ?: 306
-versionName = project.findProperty("CI_VERSION_NAME") as? String ?: "0.3.3"
-```
-
-### 4. MainActivity.java
-
-**不需要修改。**
-
-### 5. BootReceiver.java
-
-**不需要修改。**
-
-### 6. AdbHelper.java
-
-**不需要修改。**
+| 文件 | 路径 | 是否修改 |
+|------|------|----------|
+| WebServer.java | `app/src/main/java/com/tpn/adbautoenable/WebServer.java` | 是 |
+| AdbConfigService.java | `app/src/main/java/com/tpn/adbautoenable/AdbConfigService.java` | 是 |
+| build.gradle.kts | `app/build.gradle.kts` | 是（versionCode 默认值） |
+| MainActivity.java | `app/src/main/java/com/tpn/adbautoenable/MainActivity.java` | 否 |
+| BootReceiver.java | `app/src/main/java/com/tpn/adbautoenable/BootReceiver.java` | 否 |
+| AdbHelper.java | `app/src/main/java/com/tpn/adbautoenable/AdbHelper.java` | 否 |
 
 ## 六、保存设置的生效模型
 
@@ -832,4 +351,13 @@ versionName = project.findProperty("CI_VERSION_NAME") as? String ?: "0.3.3"
 - **JDK 版本必须匹配**：项目 AGP 为 9.3.1，Gradle 9.7.0，JDK 21 可用。
 - **SDK 版本**：`compileSdk = 35`，`minSdk = 26`，`targetSdk = 35`，SDK 组件安装 `android-35` / `build-tools;35.0.0`。
 - **NanoHTTPD 默认绑定行为**：当前版本既无三参构造函数，也无 `setInetAddress()` 方法，无法从代码层面强制只监听 IPv4。默认监听在 Android 上表现为 `tcp6 :::9093`（IPv4-mapped IPv6），IPv4 客户端访问正常，无需特殊处理。
-- **release 签名**：`app/build.gradle.kts` 已内置环境变量方式，需生成 `app/keystore.jks` 并设置 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`
+- **release 签名**：`app/build.gradle.kts` 已内置环境变量方式，需生成 `app/keystore.jks` 并设置 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD` 四个环境变量。
+- **versionCode 默认值**：已改为 `306`，高于设备上已装版本的 `305`，避免降级安装失败。
+- **无线调试端口机制**：无线调试启动后 adbd 监听随机端口，targetPort（如 45555）需要 `tcpip:<targetPort>` 切换后才会监听。“ADB启用”打开后必须触发一次端口切换，否则 targetPort 长期不可用。
+- **开机后 targetPort 可用时间**：开机流程 `configureAdb()` 包含 60 秒 WiFi 等待 + 30 秒稳定等待 + 15 秒等 adbd + mDNS/扫描 + 切换，顺利路径约 60~90 秒，mDNS 失败时更长。这是原项目设计，未修改。
+- **安装报错处理**：
+  - `INSTALL_FAILED_VERSION_DOWNGRADE`：调大 versionCode 默认值后重新编译安装。
+  - `INSTALL_FAILED_UPDATE_INCOMPATIBLE`：签名不匹配，需先 `uninstall` 再 `install`，卸载会丢失配对信息、ADB 密钥和 prefs 配置。
+- **目录结构不能错**：`bin`/`lib` 必须在 `cmdline-tools/latest/` 下，否则 `sdkmanager` 报错。
+- **gradlew 无需单独安装 Gradle**：首次运行会自动下载对应版本。
+- **安全风险**：该 App 将 ADB 固定在 targetPort，一旦授权连接即获得永久无限制访问权限。仅在自家可控网络使用，切勿暴露到公网。
