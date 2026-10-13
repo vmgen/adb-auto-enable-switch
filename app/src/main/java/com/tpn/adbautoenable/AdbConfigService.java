@@ -46,10 +46,18 @@ public class AdbConfigService extends Service {
         return NetworkUtils.getDeviceProtectedPrefs(this, PREFS_NAME);
     }
 
+    // Some devices disable BootReceiver behind the app's back, which takes it out
+    // of the BOOT_COMPLETED resolution set and stops the app ever starting at
+    // boot. A shell cannot undo that for an app that is not test-only, and
+    // reinstalling loses the app's adb key, but the app may set its own
+    // components, so it is repaired here on every service start.
     private void ensureBootReceiverEnabled() {
         try {
             PackageManager pm = getPackageManager();
             ComponentName receiver = new ComponentName(this, BootReceiver.class);
+            // Anything that is not enabled, rather than the one disabled state:
+            // DISABLED_USER and DISABLED_UNTIL_USED keep it out of the resolution
+            // set just as surely, and DEFAULT means the manifest value, enabled.
             int state = pm.getComponentEnabledSetting(receiver);
             if (state != PackageManager.COMPONENT_ENABLED_STATE_ENABLED
                     && state != PackageManager.COMPONENT_ENABLED_STATE_DEFAULT) {
@@ -68,6 +76,7 @@ public class AdbConfigService extends Service {
         super.onCreate();
         Log.i(TAG, "AdbConfigService onCreate() called");
 
+        // Log app version and device model for easier debugging
         String appVersion = "Unknown";
         try {
             android.content.pm.PackageInfo pInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
@@ -84,6 +93,7 @@ public class AdbConfigService extends Service {
             createNotificationChannel();
             Log.i(TAG, "Notification channel created");
 
+            // Only start web server if enabled in preferences
             SharedPreferences prefs = getPrefs();
             if (prefs.getBoolean("web_server_enabled", true)) {
                 startWebServer();
@@ -116,14 +126,17 @@ public class AdbConfigService extends Service {
         Log.i(TAG, "isBootConfigMode: " + isBootConfigMode);
 
         try {
+            // Start as foreground service IMMEDIATELY
             Notification notification = createNotification(
                     isBootConfigMode ? "Starting ADB configuration..." : "Web server running on port " + WEB_SERVER_PORT
             );
             startForeground(1, notification);
             Log.i(TAG, "Started foreground service with notification");
 
+            // Ensure the web server state matches the user's preference
             SharedPreferences prefs = getPrefs();
             if (prefs.getBoolean("web_server_enabled", true)) {
+                // NanoHTTPD's isAlive() checks if the server thread is actively running
                 if (webServer == null || !webServer.isAlive()) {
                     Log.i(TAG, "Web server enabled but not running, starting it now...");
                     startWebServer();
@@ -142,6 +155,7 @@ public class AdbConfigService extends Service {
             // 开机/服务启动时 refreshTimer=false，不重置计时；保存设置触发时 refreshTimer=true，重新计时
             enableWirelessDebuggingImmediately(refreshAdb);
 
+            // Only run boot configuration if this is a boot event
             if (isBootConfigMode) {
                 if (isConfiguring) {
                     Log.w(TAG, "Configuration already in progress, ignoring duplicate request");
@@ -150,10 +164,14 @@ public class AdbConfigService extends Service {
 
                 isConfiguring = true;
 
+                // Run configuration in background thread
                 new Thread(() -> {
                     try {
+                        // Step 1: Wait for WiFi to be connected
                         waitForWifiConnection();
+                        // Step 2: Wait for system to stabilize
                         waitForBootStabilization();
+                        // Step 3: Attempt configuration with retries
                         configureAdbWithRetries();
                     } catch (Exception e) {
                         Log.e(TAG, "Error in configuration thread", e);
@@ -162,6 +180,7 @@ public class AdbConfigService extends Service {
                     } finally {
                         isConfiguring = false;
                     }
+                    // Keep web server running
                     updateNotification("Web server running on port " + WEB_SERVER_PORT);
                 }).start();
             }
@@ -351,6 +370,7 @@ public class AdbConfigService extends Service {
                 return false;
             }
 
+            // Re-assert wireless debugging & auto-revocation settings
             Settings.Global.putInt(
                     getContentResolver(),
                     "adb_wifi_enabled",
@@ -404,6 +424,7 @@ public class AdbConfigService extends Service {
 
             AdbHelper adbHelper = new AdbHelper(this);
 
+            // Try loopback first (avoids hangs on some devices), fall back to active device IP (Fixes #8)
             boolean success = adbHelper.switchToPort("127.0.0.1", port, targetPort);
             if (!success && !deviceIP.equals("127.0.0.1")) {
                 Log.i(TAG, "Switch failed via loopback, falling back to " + deviceIP + "...");

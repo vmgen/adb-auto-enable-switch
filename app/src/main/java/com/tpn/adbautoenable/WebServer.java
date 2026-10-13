@@ -9,9 +9,7 @@ import android.util.Log;
 import fi.iki.elonen.NanoHTTPD;
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.IOException;
 import java.io.InputStreamReader;
-import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -32,8 +30,8 @@ public class WebServer extends NanoHTTPD {
     private final Context context;
     private final AdbHelper adbHelper;
 
-    public WebServer(Context context, int port) throws IOException {
-        super(port, null, Inet4Address.getByName("0.0.0.0"));
+    public WebServer(Context context, int port) {
+        super(port);
         this.context = context;
         this.adbHelper = new AdbHelper(context);
     }
