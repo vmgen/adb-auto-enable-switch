@@ -12,7 +12,7 @@ android {
         targetSdk = 35
 
         // Dynamically accept CI properties or fall back to local defaults
-        versionCode = (project.findProperty("CI_VERSION_CODE") as? String)?.toIntOrNull() ?: 12
+        versionCode = (project.findProperty("CI_VERSION_CODE") as? String)?.toIntOrNull() ?: 306
         versionName = project.findProperty("CI_VERSION_NAME") as? String ?: "0.3.3"
     }
 
