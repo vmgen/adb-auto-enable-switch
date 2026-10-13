@@ -38,9 +38,11 @@ public class AdbConfigService extends Service {
     private static final int MAX_RETRY_ATTEMPTS = 3;
     private static final int RETRY_DELAY_SECONDS = 10;
     private static final int WEB_SERVER_PORT = 9093;
+    private static final long EXPIRY_CHECK_INTERVAL_MS = 60000;  // 每分钟检查一次
 
     private WebServer webServer;
     private volatile boolean isConfiguring = false;
+    private volatile boolean expiryMonitorRunning = false;
 
     private SharedPreferences getPrefs() {
         return NetworkUtils.getDeviceProtectedPrefs(this, PREFS_NAME);
@@ -152,8 +154,14 @@ public class AdbConfigService extends Service {
             ensureTclAutostartProtectionAsync();
 
             boolean refreshAdb = intent != null && intent.getBooleanExtra("refresh_adb", false);
-            // 开机/服务启动时 refreshTimer=false，不重置计时；保存设置触发时 refreshTimer=true，重新计时
-            enableWirelessDebuggingImmediately(refreshAdb);
+
+            // 启用/禁用 adbd，内部按状态跃迁判断是否刷新 adb_enabled_at
+            enableWirelessDebuggingImmediately();
+
+            // 启用状态下启动超时监控线程
+            if (shouldEnableAdb()) {
+                startExpiryMonitor();
+            }
 
             // 用户保存设置触发启用后，异步切换 adbd 到 targetPort，确保端口真正可用
             if (refreshAdb && shouldEnableAdb()) {
@@ -263,7 +271,7 @@ public class AdbConfigService extends Service {
         return true;
     }
 
-    private void enableWirelessDebuggingImmediately(boolean refreshTimer) {
+    private void enableWirelessDebuggingImmediately() {
         try {
             if (!shouldEnableAdb()) {
                 Log.i(TAG, "ADB disabled or expired, setting adb_wifi_enabled=0");
@@ -271,21 +279,82 @@ public class AdbConfigService extends Service {
                 return;
             }
 
+            // 读当前 adb_wifi_enabled，判断是否从"没启动"变成"启动"
+            int currentAdbWifi = Settings.Global.getInt(
+                    getContentResolver(), "adb_wifi_enabled", 0);
+
             Log.i(TAG, "Enabling wireless debugging & disabling key revocation...");
             Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
             Settings.Global.putLong(getContentResolver(), "adb_allowed_connection_time", 0L);
 
-            if (refreshTimer) {
-                getPrefs().edit()
+            // 只有从没启动变成启动时，才刷新起始时间戳
+            SharedPreferences prefs = getPrefs();
+            long enabledAt = prefs.getLong("adb_enabled_at", 0);
+            if (currentAdbWifi == 0 || enabledAt == 0) {
+                prefs.edit()
                         .putLong("adb_enabled_at", System.currentTimeMillis())
                         .apply();
-                Log.i(TAG, "adb_enabled_at refreshed by user save");
+                Log.i(TAG, "adb_enabled_at refreshed (adb_wifi_enabled "
+                        + currentAdbWifi + " -> 1)");
+            } else {
+                long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
+                Log.i(TAG, "adb_enabled_at unchanged (adb already enabled, elapsed "
+                        + elapsedMinutes + " min)");
             }
         } catch (SecurityException e) {
             Log.e(TAG, "Settings write failed - WRITE_SECURE_SETTINGS missing", e);
         } catch (Exception e) {
             Log.e(TAG, "Settings write unexpected error", e);
         }
+    }
+
+    // ADB 超时监控：每分钟检查一次，过期后主动关闭无线调试
+    private void startExpiryMonitor() {
+        if (expiryMonitorRunning) {
+            Log.i(TAG, "Expiry monitor already running");
+            return;
+        }
+        expiryMonitorRunning = true;
+
+        new Thread(() -> {
+            try {
+                Log.i(TAG, "Expiry monitor started");
+                while (true) {
+                    Thread.sleep(EXPIRY_CHECK_INTERVAL_MS);
+
+                    SharedPreferences prefs = getPrefs();
+                    if (!prefs.getBoolean("adb_enabled", true)) {
+                        Log.i(TAG, "Expiry monitor: adb_enabled=false, stopping monitor");
+                        break;
+                    }
+
+                    long enabledAt = prefs.getLong("adb_enabled_at", 0);
+                    if (enabledAt == 0) {
+                        Log.i(TAG, "Expiry monitor: no start timestamp, stopping monitor");
+                        break;
+                    }
+
+                    int expiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
+                    long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
+
+                    if (elapsedMinutes >= expiryMinutes) {
+                        Log.i(TAG, "Expiry monitor: expired ("
+                                + elapsedMinutes + " >= " + expiryMinutes
+                                + "), disabling wireless debugging");
+                        Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
+                        updateStatus("Expired - ADB disabled");
+                        break;
+                    }
+                }
+            } catch (InterruptedException e) {
+                Log.e(TAG, "Expiry monitor interrupted", e);
+            } catch (Exception e) {
+                Log.e(TAG, "Expiry monitor error", e);
+            } finally {
+                expiryMonitorRunning = false;
+                Log.i(TAG, "Expiry monitor stopped");
+            }
+        }, "adb-expiry-monitor").start();
     }
 
     // 用户保存设置触发启用后，异步发现 adbd 当前随机端口并切换到 targetPort

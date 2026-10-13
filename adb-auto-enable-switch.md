@@ -1,6 +1,6 @@
 # ADB Auto-Enable 编译与安装流程及功能修改
 
-**版本号：v2026.10.13.18**
+**版本号：v2026.10.13.19**
 
 ## 一、开发流程
 
@@ -146,7 +146,7 @@ app/build/outputs/apk/release/app-release.apk
 ### 7. 上传到机顶盒安装
 
 ```bash
-adb connect 机顶盒IP:5555
+adb connect 机顶盒IP:45555
 adb install -r app-release.apk
 ```
 
@@ -188,7 +188,8 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 - Web 页面增加“ADB启用”checkbox，默认勾选。
 - Web 页面增加“ADB超时时间（分钟）”输入框，默认 1440，最大 4320，输入框下方小字提示“最大 4320（3 天）”。
 - 逻辑：adbd 启用后超过设定时长，WiFi 调试不再启动。
-- 启用后异步触发端口切换，确保 targetPort 真正可用。
+- 启用后自动触发一次端口切换，把 adbd 从随机端口切到 targetPort，确保 targetPort 真正可用。
+- 运行中由监控线程每分钟检查一次，过期后主动关闭无线调试，无需等下次重启。
 
 **无 root 实现方式：**
 
@@ -198,13 +199,19 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 - 关闭开关时，App 将 `adb_wifi_enabled` 设为 `0`，触发系统停止无线调试监听。
 - adbd 监听端口是否立即关闭、已配对连接是否立即断开，取决于机顶盒 Android 版本和厂商实现，无 root 方案下无法完全控制。
 
+**无线调试端口机制说明：**
+
+- 无线调试（`adb_wifi_enabled=1`）启动后，adbd 监听的端口是**随机的**（通常为 3xxxx 高位端口），不是固定端口。
+- 固定端口（如 45555）需要执行 `tcpip:<targetPort>` 才能让 adbd 切换过去。
+- 因此“ADB启用”打开后，仅设 `adb_wifi_enabled=1` 不会让 targetPort 可用，必须额外触发一次端口切换。
+
 ### 功能 2：Web 服务登入用户名密码
 
 - Web 页面增加“用户名”和“密码”输入框，默认 `admin` / `admin`，可修改。
 - 认证方式：HTTP Basic Auth。
 - Web 服务（9093）所有请求均需通过用户名密码验证。
-- 密码不传送到前端，密码框始终留空，placeholder 提示“留空表示不修改”。
-- 用户名或密码变化后，保存时返回 401，浏览器弹登录框要求重新登录。
+- 密码框始终留空，placeholder 提示“留空表示不修改”；密码不通过 API 返回给前端。
+- 用户名或密码修改后，保存时返回 401，浏览器弹登录框，用户输入新凭证即可登录。
 
 ### 功能 3：Web 页面配置表单
 
@@ -234,7 +241,7 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 │  ADB超时时间（分钟）: [1440]  │
 │   最大 4320（3 天）           │
 │  用户名: [admin]             │
-│  密码:   [留空表示不修改]     │
+│  密码:   [placeholder]       │
 │           [ 💾 保存 ]        │
 ├─────────────────────────────┤
 │ 📊 System Status             │  ← 保留原有
@@ -255,6 +262,16 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 └─────────────────────────────┘
 ```
 
+### 前端职责划分
+
+| 函数 | 职责 | 频率 |
+|------|------|------|
+| `loadInitialConfig()` | 回填配置输入框初值（ADB启用、ADB超时时间、用户名、targetPort） | 页面加载时一次 |
+| `refreshStatus()` | 刷新 System Status 只读字段 | 每 5 秒 |
+| `refreshLogs()` | 刷新日志区 | 每 3 秒 |
+
+配置输入框只在页面加载时回填一次，`refreshStatus()` 不碰配置输入框，避免覆盖用户正在编辑的内容。
+
 ## 四、配置项定义
 
 | prefs key | 画面名称 | 默认值 | 备注 |
@@ -262,14 +279,16 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 | `adb_enabled` | ADB启用 | `true` | checkbox |
 | `adb_expiry_minutes` | ADB超时时间（分钟） | `1440` | 最大 4320 |
 | `web_username` | 用户名 | `admin` | |
-| `web_password` | 密码 | `admin` | 不传前端 |
+| `web_password` | 密码 | `admin` | 不回传前端 |
 | `adb_enabled_at` | （内部） | `0` | 起始时间戳 |
 
 **`adb_enabled_at` 语义：**
 
-- 只在用户保存设置、且 `adb_enabled=true` 时刷新为当前时间。
-- 开机 / 服务自然启动时不刷新，只读取旧时间戳判断是否超时。
-- 超时 → `adb_wifi_enabled=0`，不启动无线调试，直到用户重新保存设置。
+- 在 adbd **从“没启动”变成“启动”** 的状态跃迁时刷新为当前时间。
+- 实现：写 `adb_wifi_enabled=1` 之前，先读当前 `adb_wifi_enabled`。若原值为 `0`，或 `adb_enabled_at` 本身为 0（首次），则刷新；否则不刷新。
+- 开机 / 服务自然启动时，如果 adbd 本来就在跑（`adb_wifi_enabled` 已是 1），不重置计时。
+- 超时 → `adb_wifi_enabled=0`，不启动无线调试，直到用户重新保存设置或 adbd 重新从关闭变启用。
+- 监控线程每分钟检查一次，过期后主动关闭无线调试。
 
 ## 五、需要修改的代码文件
 
@@ -405,6 +424,7 @@ private Response handleSaveSettings(IHTTPSession session) {
             return resp;
         }
 
+        // 凭证没变，正常跳回首页
         Response resp = newFixedLengthResponse(
                 Response.Status.REDIRECT, "text/plain", "");
         resp.addHeader("Location", "/");
@@ -417,7 +437,7 @@ private Response handleSaveSettings(IHTTPSession session) {
 }
 ```
 
-#### 改动 4：状态 JSON 不包含密码
+#### 改动 4：状态 JSON 增加新字段（不含密码）
 
 ```java
 boolean adbEnabled = prefs.getBoolean("adb_enabled", true);
@@ -454,11 +474,10 @@ String json = String.format(Locale.US,
 "        <h2>📊 System Status</h2>\n" +
 ```
 
-#### 改动 6：前端重构，职责分离
-
-新增 `loadInitialConfig()`，只在页面加载时回填配置项初值：
+#### 改动 6：前端新增 loadInitialConfig()，refreshStatus() 只负责 System Status
 
 ```javascript
+// 只在页面首次加载时回填配置输入框，之后不再覆盖用户编辑
 function loadInitialConfig() {
     fetch('/api/status')
         .then(r => r.json())
@@ -478,11 +497,8 @@ function loadInitialConfig() {
             // 密码框不回填，保持为空
         });
 }
-```
 
-`refreshStatus()` 只刷新 System Status 只读字段，删掉所有配置输入框的回填：
-
-```javascript
+// refreshStatus 只负责 System Status 只读区域
 function refreshStatus() {
     fetch('/api/status')
         .then(r => r.json())
@@ -513,7 +529,7 @@ function refreshStatus() {
 }
 ```
 
-初始化处：
+初始化处调用：
 
 ```javascript
 loadInitialConfig();
@@ -528,7 +544,14 @@ startLogsAutoRefresh();
 
 **文件路径**：`app/src/main/java/com/tpn/adbautoenable/AdbConfigService.java`
 
-#### 改动 1：新增 shouldEnableAdb()
+#### 改动 1：新增字段与常量
+
+```java
+private static final long EXPIRY_CHECK_INTERVAL_MS = 60000;  // 每分钟检查一次
+private volatile boolean expiryMonitorRunning = false;
+```
+
+#### 改动 2：新增 shouldEnableAdb()
 
 ```java
 private boolean shouldEnableAdb() {
@@ -550,10 +573,10 @@ private boolean shouldEnableAdb() {
 }
 ```
 
-#### 改动 2：enableWirelessDebuggingImmediately() 加判断与参数
+#### 改动 3：enableWirelessDebuggingImmediately() 改为无参，按状态跃迁刷新
 
 ```java
-private void enableWirelessDebuggingImmediately(boolean refreshTimer) {
+private void enableWirelessDebuggingImmediately() {
     try {
         if (!shouldEnableAdb()) {
             Log.i(TAG, "ADB disabled or expired, setting adb_wifi_enabled=0");
@@ -561,15 +584,27 @@ private void enableWirelessDebuggingImmediately(boolean refreshTimer) {
             return;
         }
 
+        // 读当前 adb_wifi_enabled，判断是否从"没启动"变成"启动"
+        int currentAdbWifi = Settings.Global.getInt(
+                getContentResolver(), "adb_wifi_enabled", 0);
+
         Log.i(TAG, "Enabling wireless debugging & disabling key revocation...");
         Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
         Settings.Global.putLong(getContentResolver(), "adb_allowed_connection_time", 0L);
 
-        if (refreshTimer) {
-            getPrefs().edit()
-                .putLong("adb_enabled_at", System.currentTimeMillis())
-                .apply();
-            Log.i(TAG, "adb_enabled_at refreshed by user save");
+        // 只有从没启动变成启动时，才刷新起始时间戳
+        SharedPreferences prefs = getPrefs();
+        long enabledAt = prefs.getLong("adb_enabled_at", 0);
+        if (currentAdbWifi == 0 || enabledAt == 0) {
+            prefs.edit()
+                    .putLong("adb_enabled_at", System.currentTimeMillis())
+                    .apply();
+            Log.i(TAG, "adb_enabled_at refreshed (adb_wifi_enabled "
+                    + currentAdbWifi + " -> 1)");
+        } else {
+            long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
+            Log.i(TAG, "adb_enabled_at unchanged (adb already enabled, elapsed "
+                    + elapsedMinutes + " min)");
         }
     } catch (SecurityException e) {
         Log.e(TAG, "Settings write failed - WRITE_SECURE_SETTINGS missing", e);
@@ -579,14 +614,73 @@ private void enableWirelessDebuggingImmediately(boolean refreshTimer) {
 }
 ```
 
-#### 改动 3：onStartCommand() 调用点调整 + 新增端口切换触发
+#### 改动 4：新增 startExpiryMonitor()
+
+```java
+// ADB 超时监控：每分钟检查一次，过期后主动关闭无线调试
+private void startExpiryMonitor() {
+    if (expiryMonitorRunning) {
+        Log.i(TAG, "Expiry monitor already running");
+        return;
+    }
+    expiryMonitorRunning = true;
+
+    new Thread(() -> {
+        try {
+            Log.i(TAG, "Expiry monitor started");
+            while (true) {
+                Thread.sleep(EXPIRY_CHECK_INTERVAL_MS);
+
+                SharedPreferences prefs = getPrefs();
+                if (!prefs.getBoolean("adb_enabled", true)) {
+                    Log.i(TAG, "Expiry monitor: adb_enabled=false, stopping monitor");
+                    break;
+                }
+
+                long enabledAt = prefs.getLong("adb_enabled_at", 0);
+                if (enabledAt == 0) {
+                    Log.i(TAG, "Expiry monitor: no start timestamp, stopping monitor");
+                    break;
+                }
+
+                int expiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
+                long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
+
+                if (elapsedMinutes >= expiryMinutes) {
+                    Log.i(TAG, "Expiry monitor: expired ("
+                            + elapsedMinutes + " >= " + expiryMinutes
+                            + "), disabling wireless debugging");
+                    Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
+                    updateStatus("Expired - ADB disabled");
+                    break;
+                }
+            }
+        } catch (InterruptedException e) {
+            Log.e(TAG, "Expiry monitor interrupted", e);
+        } catch (Exception e) {
+            Log.e(TAG, "Expiry monitor error", e);
+        } finally {
+            expiryMonitorRunning = false;
+            Log.i(TAG, "Expiry monitor stopped");
+        }
+    }, "adb-expiry-monitor").start();
+}
+```
+
+#### 改动 5：onStartCommand() 调用点调整
 
 ```java
 ensureTclAutostartProtectionAsync();
 
 boolean refreshAdb = intent != null && intent.getBooleanExtra("refresh_adb", false);
-// 开机/服务启动时 refreshTimer=false，不重置计时；保存设置触发时 refreshTimer=true，重新计时
-enableWirelessDebuggingImmediately(refreshAdb);
+
+// 启用/禁用 adbd，内部按状态跃迁判断是否刷新 adb_enabled_at
+enableWirelessDebuggingImmediately();
+
+// 启用状态下启动超时监控线程
+if (shouldEnableAdb()) {
+    startExpiryMonitor();
+}
 
 // 用户保存设置触发启用后，异步切换 adbd 到 targetPort，确保端口真正可用
 if (refreshAdb && shouldEnableAdb()) {
@@ -594,9 +688,10 @@ if (refreshAdb && shouldEnableAdb()) {
 }
 ```
 
-#### 改动 4：新增 switchToTargetPortAsync()
+#### 改动 6：新增 switchToTargetPortAsync()
 
 ```java
+// 用户保存设置触发启用后，异步发现 adbd 当前随机端口并切换到 targetPort
 private void switchToTargetPortAsync() {
     new Thread(() -> {
         try {
@@ -656,7 +751,7 @@ private void switchToTargetPortAsync() {
 }
 ```
 
-#### 改动 5：configureAdb() 加判断
+#### 改动 7：configureAdb() 加判断
 
 ```java
 private boolean configureAdb() {
@@ -690,67 +785,51 @@ versionName = project.findProperty("CI_VERSION_NAME") as? String ?: "0.3.3"
 
 ### 4. MainActivity.java
 
-**不需要修改。** 现有 UI 是 Web 服务开关，保留。
+**不需要修改。**
 
 ### 5. BootReceiver.java
 
-**不需要修改。** 它只负责启动 Service。
+**不需要修改。**
 
 ### 6. AdbHelper.java
 
-**不需要修改。** 端口切换逻辑与 ADB启用、ADB超时时间正交。
+**不需要修改。**
 
 ## 六、保存设置的生效模型
 
-| 场景 | 是否刷新 `adb_enabled_at` | 是否触发端口切换 | 行为 |
-|------|--------------------------|-----------------|------|
-| 开机 / 服务自然启动 | 否 | 否（由开机流程 configureAdb 处理） | 读旧时间戳，超时就 `adb_wifi_enabled=0` |
-| 用户保存设置 | 是 | 是（`switchToTargetPortAsync`） | 重新计时，立即启用，异步切到 targetPort |
+| 场景 | 是否刷新 `adb_enabled_at` | 行为 |
+|------|--------------------------|------|
+| 开机 / 服务自然启动，adbd 已在跑 | 否 | 读旧时间戳，超时就 `adb_wifi_enabled=0` |
+| adbd 从关闭变启用（含用户保存、首次启动） | 是 | 重新计时，立即启用，异步切端口 |
+| 运行中到达超时 | — | 监控线程每分钟检查，过期后设 `adb_wifi_enabled=0` |
 
 保存后立即生效的链路：
 
 1. 用户在 Web 页面点“保存”
 2. `POST /api/settings` → `handleSaveSettings()`
-3. 写入 prefs
+3. 写入 prefs（`adb_enabled`、`adb_expiry_minutes`、`web_username`、`web_password`）
 4. `startForegroundService(AdbConfigService, refresh_adb=true)`
 5. `AdbConfigService.onStartCommand()` 识别 `refresh_adb`
-6. 调用 `enableWirelessDebuggingImmediately(true)` → 刷新 `adb_enabled_at`，立即写 `adb_wifi_enabled`
-7. 若 `shouldEnableAdb()` 为 true，触发 `switchToTargetPortAsync()` → 等 5 秒 → mDNS 发现随机端口 → `switchToPort(targetPort)`
-8. 端口切换完成后，targetPort 真正可用，页面 System Status 显示 Available
+6. 调用 `enableWirelessDebuggingImmediately()`，按 `adb_wifi_enabled` 状态跃迁决定是否刷新 `adb_enabled_at`
+7. 若 `shouldEnableAdb()` 为 true，调用 `startExpiryMonitor()` 启动超时监控
+8. 若 `refreshAdb && shouldEnableAdb()`，调用 `switchToTargetPortAsync()` → 等 5 秒 → mDNS 发现 → 端口扫描兜底 → `switchToPort(targetPort)`
 
-## 七、关键机制说明
+## 七、超时监控行为
 
-### 无线调试端口 vs targetPort
+| 情况 | 监控线程行为 |
+|------|-------------|
+| `adb_enabled=false` | 下一分钟检查时退出 |
+| `adb_enabled_at=0` | 下一分钟检查时退出 |
+| `elapsed >= adb_expiry_minutes` | 设 `adb_wifi_enabled=0`，状态改为 `Expired - ADB disabled`，退出 |
+| 未过期 | 继续每分钟轮询 |
+| 用户运行中修改超时时间 | 下次轮询自动读取新值，无需重启线程 |
+| 用户关闭再启用 ADB | `adb_enabled_at` 刷新，监控线程按新时间判断 |
 
-- **无线调试（`adb_wifi_enabled`）端口是系统随机分配的**，通常是 3xxxx 高位端口，与 targetPort 无关。
-- **targetPort（默认 5555，可配置为 45555 等）只有在执行 `tcpip:<targetPort>` 之后才会监听。**
-- 所以“启用 ADB”后，targetPort 不会自动可用，必须触发一次端口切换。
-- 页面 System Status 的 `ADB Target Port` 检查的是 targetPort，不是无线调试端口。
-- JSON 字段名 `adb5555Available` 是原项目历史命名，值对应 targetPort，不是固定 5555。
-
-### 启用 ADB 后的端口切换
-
-- 开关打开 → `adb_wifi_enabled=1` → adbd 在随机端口启动。
-- `switchToTargetPortAsync()` 等 5 秒后，通过 mDNS 发现随机端口（失败则端口扫描），再 `tcpip:<targetPort>` 切换到 targetPort。
-- 切换成功后，targetPort 才真正可用。
-
-### 开机路径
-
-- 开机走 `isBootConfigMode` → `configureAdbWithRetries()` → `configureAdb()`。
-- 内含 60 秒 WiFi 等待、30 秒稳定、15 秒等 adbd、mDNS 10 秒、端口扫描 15 秒。
-- 顺利路径约 60~90 秒，mDNS 失败路径可能 100 秒以上。
-- 这些等待是原项目设计，本次不改。
+监控线程靠 `expiryMonitorRunning` 标志防重复启动。每次服务启动时若 `shouldEnableAdb()` 为 true，调用 `startExpiryMonitor()`，已运行则直接返回。
 
 ## 八、注意事项
 
 - **JDK 版本必须匹配**：项目 AGP 为 9.3.1，Gradle 9.7.0，JDK 21 可用。
 - **SDK 版本**：`compileSdk = 35`，`minSdk = 26`，`targetSdk = 35`，SDK 组件安装 `android-35` / `build-tools;35.0.0`。
-- **NanoHTTPD 默认绑定行为**：当前版本既无三参构造函数，也无 `setInetAddress()` 方法，无法从代码层面强制只监听 IPv4。默认监听在 Android 上表现为 `tcp6 :::9093`（IPv4-mapped IPv6），IPv4 客户端访问正常。
-- **release 签名**：`app/build.gradle.kts` 已内置环境变量方式，需生成 `app/keystore.jks` 并设置 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD` 四个环境变量。
-- **versionCode 默认值**：已改为 `306`，高于设备上已装版本的 `305`。
-- **安装报错处理**：
-  - `INSTALL_FAILED_VERSION_DOWNGRADE`：调大 versionCode 默认值后重新编译安装。
-  - `INSTALL_FAILED_UPDATE_INCOMPATIBLE`：签名不匹配，需先 `uninstall` 再 `install`。
-- **目录结构不能错**：`bin`/`lib` 必须在 `cmdline-tools/latest/` 下，否则 `sdkmanager` 报错。
-- **gradlew 无需单独安装 Gradle**：首次运行会自动下载对应版本。
-- **安全风险**：该 App 将 ADB 固定在 targetPort，一旦授权连接即获得永久无限制访问权限。仅在自家可控网络使用，切勿暴露到公网。
+- **NanoHTTPD 默认绑定行为**：当前版本既无三参构造函数，也无 `setInetAddress()` 方法，无法从代码层面强制只监听 IPv4。默认监听在 Android 上表现为 `tcp6 :::9093`（IPv4-mapped IPv6），IPv4 客户端访问正常，无需特殊处理。
+- **release 签名**：`app/build.gradle.kts` 已内置环境变量方式，需生成 `app/keystore.jks` 并设置 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`

@@ -1,3 +1,10 @@
+> [!NOTE]
+> **This is a fork of [mouldybread/adb-auto-enable](https://github.com/mouldybread/adb-auto-enable) with the following additions:**
+>
+> 1. **Web interface authentication** — access to the web UI (port 9093) now requires a username and password (default `admin` / `admin`), instead of being open to anyone on the network.
+> 2. **Web-based on/off control for wireless ADB** — the web UI provides an "ADB Enable" switch to turn wireless debugging on or off, without needing to reboot or touch the device.
+> 3. **Automatic expiry for wireless ADB** — an "ADB Expiry Time (minutes)" setting (default 1440, max 4320) automatically disables wireless debugging once the configured duration has elapsed since it was last enabled.
+
 # 🔧 adb-auto-enable
 
 **Automatically enable wireless ADB debugging and switch to your chosen port (default 5555) on every boot, no root required!**
