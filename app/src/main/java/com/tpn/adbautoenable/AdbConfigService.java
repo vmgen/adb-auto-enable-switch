@@ -155,6 +155,11 @@ public class AdbConfigService extends Service {
             // 开机/服务启动时 refreshTimer=false，不重置计时；保存设置触发时 refreshTimer=true，重新计时
             enableWirelessDebuggingImmediately(refreshAdb);
 
+            // 用户保存设置触发启用后，异步切换 adbd 到 targetPort，确保端口真正可用
+            if (refreshAdb && shouldEnableAdb()) {
+                switchToTargetPortAsync();
+            }
+
             // Only run boot configuration if this is a boot event
             if (isBootConfigMode) {
                 if (isConfiguring) {
@@ -281,6 +286,65 @@ public class AdbConfigService extends Service {
         } catch (Exception e) {
             Log.e(TAG, "Settings write unexpected error", e);
         }
+    }
+
+    // 用户保存设置触发启用后，异步发现 adbd 当前随机端口并切换到 targetPort
+    private void switchToTargetPortAsync() {
+        new Thread(() -> {
+            try {
+                Log.i(TAG, "Post-enable: waiting for adbd to start...");
+                Thread.sleep(5000);  // 等 adbd 在随机端口启动
+
+                if (!shouldEnableAdb()) {
+                    Log.i(TAG, "Post-enable: ADB no longer enabled, aborting port switch");
+                    return;
+                }
+
+                Log.i(TAG, "Post-enable: discovering current ADB port...");
+                int port = discoverAdbPortViaMdns();
+                if (port == -1) {
+                    Log.i(TAG, "Post-enable: mDNS failed, scanning ports...");
+                    port = scanForAdbPort();
+                }
+
+                if (port == -1) {
+                    Log.e(TAG, "Post-enable: could not find ADB port");
+                    updateStatus("Failed - port not found after enable");
+                    return;
+                }
+
+                Log.i(TAG, "Post-enable: found ADB on port " + port);
+
+                int targetPort = getTargetPort();
+                if (port == targetPort) {
+                    Log.i(TAG, "Post-enable: already on target port " + targetPort);
+                    updateStatus("Success - ADB on port " + targetPort);
+                    return;
+                }
+
+                Log.i(TAG, "Post-enable: switching to target port " + targetPort + "...");
+                AdbHelper adbHelper = new AdbHelper(this);
+                String deviceIP = getDeviceIP();
+
+                boolean success = adbHelper.switchToPort("127.0.0.1", port, targetPort);
+                if (!success && !deviceIP.equals("127.0.0.1")) {
+                    Log.i(TAG, "Post-enable: switch failed via loopback, retrying via " + deviceIP);
+                    success = adbHelper.switchToPort(deviceIP, port, targetPort);
+                }
+
+                if (success) {
+                    Log.i(TAG, "Post-enable: switched to port " + targetPort);
+                    updateStatus("Success - ADB on port " + targetPort);
+                } else {
+                    Log.e(TAG, "Post-enable: failed to switch to port " + targetPort);
+                    updateStatus("Failed - could not switch port after enable");
+                }
+            } catch (InterruptedException e) {
+                Log.e(TAG, "Post-enable: interrupted", e);
+            } catch (Exception e) {
+                Log.e(TAG, "Post-enable: unexpected error", e);
+            }
+        }, "post-enable-port-switch").start();
     }
 
     private void startWebServer() {
