@@ -1,6 +1,7 @@
 package com.tpn.adbautoenable;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
@@ -8,10 +9,13 @@ import android.util.Log;
 import fi.iki.elonen.NanoHTTPD;
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -28,8 +32,8 @@ public class WebServer extends NanoHTTPD {
     private final Context context;
     private final AdbHelper adbHelper;
 
-    public WebServer(Context context, int port) {
-        super(port);
+    public WebServer(Context context, int port) throws IOException {
+        super(port, null, Inet4Address.getByName("0.0.0.0"));
         this.context = context;
         this.adbHelper = new AdbHelper(context);
     }
@@ -43,7 +47,18 @@ public class WebServer extends NanoHTTPD {
         String uri = session.getUri();
         Method method = session.getMethod();
 
-        if (uri.equals("/api/pair") && method == Method.POST) {
+        // ---- HTTP Basic Auth ----
+        String authHeader = session.getHeaders().get("authorization");
+        if (!isAuthorized(authHeader)) {
+            Response resp = newFixedLengthResponse(
+                    Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized");
+            resp.addHeader("WWW-Authenticate", "Basic realm=\"ADB Auto-Enable\"");
+            return resp;
+        }
+
+        if (uri.equals("/api/settings") && method == Method.POST) {
+            return handleSaveSettings(session);
+        } else if (uri.equals("/api/pair") && method == Method.POST) {
             return handlePairing(session);
         } else if (uri.equals("/api/status")) {
             return handleStatus();
@@ -64,6 +79,73 @@ public class WebServer extends NanoHTTPD {
         }
     }
 
+    private boolean isAuthorized(String authHeader) {
+        if (authHeader == null || !authHeader.startsWith("Basic ")) {
+            return false;
+        }
+        try {
+            String decoded = new String(Base64.getDecoder().decode(authHeader.substring(6)));
+            String[] parts = decoded.split(":", 2);
+            if (parts.length != 2) return false;
+
+            SharedPreferences prefs = getPrefs();
+            String user = prefs.getString("web_username", "admin");
+            String pass = prefs.getString("web_password", "admin");
+            return parts[0].equals(user) && parts[1].equals(pass);
+        } catch (Exception e) {
+            Log.e(TAG, "Auth decode error", e);
+            return false;
+        }
+    }
+
+    private Response handleSaveSettings(IHTTPSession session) {
+        try {
+            Map<String, String> files = new HashMap<>();
+            session.parseBody(files);
+            Map<String, List<String>> params = session.getParameters();
+
+            SharedPreferences prefs = getPrefs();
+            SharedPreferences.Editor editor = prefs.edit();
+
+            editor.putBoolean("adb_enabled", params.containsKey("adb_enabled"));
+
+            List<String> expList = params.get("adb_expiry_minutes");
+            if (expList != null && !expList.isEmpty()) {
+                try {
+                    int m = Integer.parseInt(expList.get(0));
+                    editor.putInt("adb_expiry_minutes", Math.max(1, Math.min(4320, m)));
+                } catch (NumberFormatException ignored) {}
+            }
+
+            List<String> userList = params.get("web_username");
+            if (userList != null && !userList.isEmpty() && !userList.get(0).isEmpty()) {
+                editor.putString("web_username", userList.get(0));
+            }
+
+            List<String> passList = params.get("web_password");
+            if (passList != null && !passList.isEmpty() && !passList.get(0).isEmpty()) {
+                editor.putString("web_password", passList.get(0));
+            }
+
+            editor.apply();
+            Log.i(TAG, "Web API: settings saved");
+
+            // 保存后立即刷新 adbd 状态，并重新计时
+            Intent intent = new Intent(context, AdbConfigService.class);
+            intent.putExtra("refresh_adb", true);
+            context.startForegroundService(intent);
+
+            Response resp = newFixedLengthResponse(
+                    Response.Status.REDIRECT, "text/plain", "");
+            resp.addHeader("Location", "/");
+            return resp;
+        } catch (Exception e) {
+            Log.e(TAG, "Web API: save settings error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR,
+                    "application/json", "{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
     private Response handleToggleWebServer(IHTTPSession session) {
         try {
             Map<String, String> files = new HashMap<>();
@@ -78,7 +160,6 @@ public class WebServer extends NanoHTTPD {
             Log.i(TAG, "Web API: Web server enabled set to " + enable);
 
             if (!enable) {
-                // Stop server on a background thread after a brief delay so response finishes sending
                 new Thread(() -> {
                     try {
                         Thread.sleep(500);
@@ -198,9 +279,15 @@ public class WebServer extends NanoHTTPD {
 
         boolean adbTargetAvailable = checkTargetPortAvailable();
 
+        boolean adbEnabled = prefs.getBoolean("adb_enabled", true);
+        int adbExpiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
+        String webUsername = prefs.getString("web_username", "admin");
+        String webPassword = prefs.getString("web_password", "admin");
+
         String json = String.format(Locale.US,
-                "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b}",
-                lastStatus, currentPort, isPaired, adbTargetAvailable, targetPort, webServerEnabled
+                "{\"lastStatus\":\"%s\",\"currentPort\":%d,\"isPaired\":%b,\"adb5555Available\":%b,\"targetPort\":%d,\"webServerEnabled\":%b,\"adbEnabled\":%b,\"adbExpiryMinutes\":%d,\"webUsername\":\"%s\",\"webPassword\":\"%s\"}",
+                lastStatus, currentPort, isPaired, adbTargetAvailable, targetPort, webServerEnabled,
+                adbEnabled, adbExpiryMinutes, webUsername, webPassword
         );
         Log.d(TAG, "handleStatus() completed");
         return newFixedLengthResponse(Response.Status.OK, "application/json", json);
@@ -318,12 +405,10 @@ public class WebServer extends NanoHTTPD {
         String deviceIP = getDeviceIP();
         int targetPort = getTargetPort();
 
-        // Check device IP first (fixes Chromecast/TV devices that don't expose loopback)
         if (!deviceIP.equals("127.0.0.1") && checkSocket(deviceIP, targetPort)) {
             return true;
         }
 
-        // Fallback to loopback
         return checkSocket("127.0.0.1", targetPort);
     }
 
@@ -331,7 +416,6 @@ public class WebServer extends NanoHTTPD {
         int targetPort = getTargetPort();
         String deviceIP = getDeviceIP();
 
-        // Check target port first
         if (!deviceIP.equals("127.0.0.1") && checkSocket(deviceIP, targetPort)) {
             return targetPort;
         }
@@ -339,7 +423,6 @@ public class WebServer extends NanoHTTPD {
             return targetPort;
         }
 
-        // Check last known successful port if different from target
         SharedPreferences prefs = getPrefs();
         int lastPort = prefs.getInt("last_port", -1);
         if (lastPort > 0 && lastPort != targetPort) {
@@ -389,7 +472,6 @@ public class WebServer extends NanoHTTPD {
 
                 Log.i(TAG, "Web API: Found ADB on port " + port + ", switching to target port " + targetPort + "...");
 
-                // Try loopback first, fall back to live device IP (Fixes #8)
                 boolean success = adbHelper.switchToPort("127.0.0.1", port, targetPort);
                 if (!success && !deviceIP.equals("127.0.0.1")) {
                     Log.i(TAG, "Web API: Switch failed via loopback, retrying via " + deviceIP + "...");
@@ -566,6 +648,18 @@ public class WebServer extends NanoHTTPD {
                 "    <h1>🔧 ADB Auto-Enable Configuration</h1>\n" +
                 "    \n" +
                 "    <div class=\"card\">\n" +
+                "        <h2>⚙️ ADB 设置</h2>\n" +
+                "        <form method=\"POST\" action=\"/api/settings\">\n" +
+                "            <label><input type=\"checkbox\" id=\"adb-enabled-input\" name=\"adb_enabled\" /> ADB启用</label><br><br>\n" +
+                "            <label>ADB超时时间（分钟）: <input type=\"number\" id=\"adb-expiry-input\" name=\"adb_expiry_minutes\" min=\"1\" max=\"4320\" /></label><br>\n" +
+                "            <small style=\"font-size:12px;color:#888;\">最大 4320（3 天）</small><br><br>\n" +
+                "            <label>用户名: <input type=\"text\" id=\"web-username-input\" name=\"web_username\" /></label><br><br>\n" +
+                "            <label>密码: <input type=\"password\" id=\"web-password-input\" name=\"web_password\" /></label><br><br>\n" +
+                "            <button type=\"submit\">💾 保存</button>\n" +
+                "        </form>\n" +
+                "    </div>\n" +
+                "    \n" +
+                "    <div class=\"card\">\n" +
                 "        <h2>📊 System Status</h2>\n" +
                 "        <div id=\"status-display\">\n" +
                 "            <div class=\"status-row\">\n" +
@@ -708,6 +802,24 @@ public class WebServer extends NanoHTTPD {
                 "                    const portInput = document.getElementById('target-port-input');\n" +
                 "                    if (document.activeElement !== portInput) {\n" +
                 "                        portInput.value = data.targetPort;\n" +
+                "                    }\n" +
+                "                    \n" +
+                "                    const adbEnabledInput = document.getElementById('adb-enabled-input');\n" +
+                "                    if (adbEnabledInput) adbEnabledInput.checked = data.adbEnabled;\n" +
+                "                    \n" +
+                "                    const adbExpiryInput = document.getElementById('adb-expiry-input');\n" +
+                "                    if (adbExpiryInput && document.activeElement !== adbExpiryInput) {\n" +
+                "                        adbExpiryInput.value = data.adbExpiryMinutes;\n" +
+                "                    }\n" +
+                "                    \n" +
+                "                    const webUsernameInput = document.getElementById('web-username-input');\n" +
+                "                    if (webUsernameInput && document.activeElement !== webUsernameInput) {\n" +
+                "                        webUsernameInput.value = data.webUsername;\n" +
+                "                    }\n" +
+                "                    \n" +
+                "                    const webPasswordInput = document.getElementById('web-password-input');\n" +
+                "                    if (webPasswordInput && document.activeElement !== webPasswordInput) {\n" +
+                "                        webPasswordInput.value = data.webPassword;\n" +
                 "                    }\n" +
                 "                    \n" +
                 "                    if (data.isPaired) {\n" +
