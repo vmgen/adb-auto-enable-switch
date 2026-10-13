@@ -499,7 +499,7 @@ public class WebServer extends NanoHTTPD {
                 }
 
                 if (success) {
-                    Log.i(TAG, "Web API: Web API: Successfully switched to port " + targetPort);
+                    Log.i(TAG, "Web API: Successfully switched to port " + targetPort);
                 } else {
                     Log.e(TAG, "Web API: Failed to switch to port " + targetPort);
                 }
@@ -592,7 +592,7 @@ public class WebServer extends NanoHTTPD {
 
             @Override
             public void onStopDiscoveryFailed(String serviceType, int errorCode) {
-                Log.e(TAG, "Discovery stop failed: " + errorCode);
+                Log.e(TAG, "Discovery stop failed: error " + errorCode);
             }
         };
 
