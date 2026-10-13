@@ -155,8 +155,8 @@ public class AdbConfigService extends Service {
 
             boolean refreshAdb = intent != null && intent.getBooleanExtra("refresh_adb", false);
 
-            // 启用/禁用 adbd，内部按状态跃迁判断是否刷新 adb_enabled_at
-            enableWirelessDebuggingImmediately();
+            // 启用/禁用 adbd；refreshAdb=true 时刷新 adb_enabled_at，否则保留旧计时
+            enableWirelessDebuggingImmediately(refreshAdb);
 
             // 启用状态下启动超时监控线程
             if (shouldEnableAdb()) {
@@ -271,7 +271,7 @@ public class AdbConfigService extends Service {
         return true;
     }
 
-    private void enableWirelessDebuggingImmediately() {
+    private void enableWirelessDebuggingImmediately(boolean refreshTimer) {
         try {
             if (!shouldEnableAdb()) {
                 Log.i(TAG, "ADB disabled or expired, setting adb_wifi_enabled=0");
@@ -279,27 +279,22 @@ public class AdbConfigService extends Service {
                 return;
             }
 
-            // 读当前 adb_wifi_enabled，判断是否从"没启动"变成"启动"
-            int currentAdbWifi = Settings.Global.getInt(
-                    getContentResolver(), "adb_wifi_enabled", 0);
-
             Log.i(TAG, "Enabling wireless debugging & disabling key revocation...");
             Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
             Settings.Global.putLong(getContentResolver(), "adb_allowed_connection_time", 0L);
 
-            // 只有从没启动变成启动时，才刷新起始时间戳
+            // 只在用户主动启用，或首次无值时刷新起始时间戳
             SharedPreferences prefs = getPrefs();
             long enabledAt = prefs.getLong("adb_enabled_at", 0);
-            if (currentAdbWifi == 0 || enabledAt == 0) {
+            if (refreshTimer || enabledAt == 0) {
                 prefs.edit()
                         .putLong("adb_enabled_at", System.currentTimeMillis())
                         .apply();
-                Log.i(TAG, "adb_enabled_at refreshed (adb_wifi_enabled "
-                        + currentAdbWifi + " -> 1)");
+                Log.i(TAG, "adb_enabled_at refreshed (refreshTimer=" + refreshTimer
+                        + ", enabledAt=" + enabledAt + ")");
             } else {
                 long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
-                Log.i(TAG, "adb_enabled_at unchanged (adb already enabled, elapsed "
-                        + elapsedMinutes + " min)");
+                Log.i(TAG, "adb_enabled_at unchanged (elapsed " + elapsedMinutes + " min)");
             }
         } catch (SecurityException e) {
             Log.e(TAG, "Settings write failed - WRITE_SECURE_SETTINGS missing", e);

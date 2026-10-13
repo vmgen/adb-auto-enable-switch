@@ -104,9 +104,11 @@ public class WebServer extends NanoHTTPD {
 
             SharedPreferences prefs = getPrefs();
 
-            // 写之前先记录旧凭证，用于判断是否变化
+            // 记录旧凭证，用于判断是否变化
             String oldUsername = prefs.getString("web_username", "admin");
             String oldPassword = prefs.getString("web_password", "admin");
+            // 记录旧的 adb_enabled，用于判断是否从关到开
+            boolean oldEnabled = prefs.getBoolean("adb_enabled", true);
 
             SharedPreferences.Editor editor = prefs.edit();
 
@@ -133,9 +135,13 @@ public class WebServer extends NanoHTTPD {
             editor.apply();
             Log.i(TAG, "Web API: settings saved");
 
-            // 保存后立即刷新 adbd 状态，并重新计时
+            // 判断 adb_enabled 是否从关到开
+            boolean newEnabled = prefs.getBoolean("adb_enabled", true);
+            boolean enableTransition = !oldEnabled && newEnabled;
+
+            // 只有从关闭变为开启，才触发重新计时
             Intent intent = new Intent(context, AdbConfigService.class);
-            intent.putExtra("refresh_adb", true);
+            intent.putExtra("refresh_adb", enableTransition);
             context.startForegroundService(intent);
 
             // 判断凭证是否变化
