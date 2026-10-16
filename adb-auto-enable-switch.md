@@ -1,6 +1,6 @@
 # ADB Auto-Enable 编译与安装流程及功能修改
 
-**版本号：v2026.10.13.20**
+**版本号：v2026.10.16.1**
 
 ## 一、开发流程
 
@@ -190,6 +190,7 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 - 逻辑：adbd 启用后超过设定时长，WiFi 调试不再启动。
 - 启用后自动触发一次端口切换，把 adbd 从随机端口切到 targetPort，确保 targetPort 真正可用。
 - 运行中由监控线程每分钟检查一次，过期后主动关闭无线调试，无需等下次重启。
+- 超时后，用户在 Web 页面点“保存”即可重新计时并恢复启用。
 
 **无 root 实现方式：**
 
@@ -298,9 +299,12 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 **`adb_enabled_at` 语义：**
 
 - 在 adbd **从“没启动”变成“启动”** 的状态跃迁时刷新为当前时间。
-- 实现：写 `adb_wifi_enabled=1` 之前，先读当前 `adb_wifi_enabled`。若原值为 `0`，或 `adb_enabled_at` 本身为 0（首次），则刷新；否则不刷新。
-- 开机 / 服务自然启动时，如果 adbd 本来就在跑（`adb_wifi_enabled` 已是 1），不重置计时。
-- 超时 → `adb_wifi_enabled=0`，不启动无线调试，直到用户重新保存设置或 adbd 重新从关闭变启用。
+- 刷新条件（任一成立）：
+  1. 用户把 `adb_enabled` 从 false 改成 true（从关到开）。
+  2. 首次无值（`adb_enabled_at == 0`）。
+  3. 已超时（`elapsed >= adb_expiry_minutes`）且用户保存设置（开关仍启用）—— 视为重新启用。
+- 重启 / 服务自然启动时**不刷新**，保留旧时间戳，超时就不启用。
+- 超时 → `adb_wifi_enabled=0`，不启动无线调试。
 - 监控线程每分钟检查一次，过期后主动关闭无线调试。
 
 ## 五、需要修改的代码文件
@@ -316,20 +320,26 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 
 ## 六、保存设置的生效模型
 
-| 场景 | 是否刷新 `adb_enabled_at` | 行为 |
-|------|--------------------------|------|
-| 开机 / 服务自然启动，adbd 已在跑 | 否 | 读旧时间戳，超时就 `adb_wifi_enabled=0` |
-| adbd 从关闭变启用（含用户保存、首次启动） | 是 | 重新计时，立即启用，异步切端口 |
-| 运行中到达超时 | — | 监控线程每分钟检查，过期后设 `adb_wifi_enabled=0` |
+| 场景 | `refresh_adb` | 是否刷新 `adb_enabled_at` |
+|------|--------------|--------------------------|
+| 重启 | false | 否，保留旧值，超时就不启用 |
+| 用户关掉再打开 ADB | true | 是，重新计时 |
+| 用户只改超时时间，ADB 一直开着、未超时 | false | 否，保持原计时 |
+| 已超时，用户点保存（开关仍勾着） | true | 是，重新计时并启用 |
+| 首次安装（`enabledAt==0`） | false | 是（靠 `enabledAt == 0` 兜底） |
+
+`refresh_adb` 的计算：`enableTransition || expired`，其中：
+- `enableTransition = !oldEnabled && newEnabled`
+- `expired = newEnabled && enabledAt>0 && (elapsed >= adb_expiry_minutes)`
 
 保存后立即生效的链路：
 
 1. 用户在 Web 页面点“保存”
 2. `POST /api/settings` → `handleSaveSettings()`
 3. 写入 prefs（`adb_enabled`、`adb_expiry_minutes`、`web_username`、`web_password`）
-4. `startForegroundService(AdbConfigService, refresh_adb=true)`
+4. 计算 `refresh_adb`，通过 `startForegroundService(AdbConfigService, refresh_adb)` 传递
 5. `AdbConfigService.onStartCommand()` 识别 `refresh_adb`
-6. 调用 `enableWirelessDebuggingImmediately()`，按 `adb_wifi_enabled` 状态跃迁决定是否刷新 `adb_enabled_at`
+6. 调用 `enableWirelessDebuggingImmediately(refreshAdb)`，条件满足时刷新 `adb_enabled_at`
 7. 若 `shouldEnableAdb()` 为 true，调用 `startExpiryMonitor()` 启动超时监控
 8. 若 `refreshAdb && shouldEnableAdb()`，调用 `switchToTargetPortAsync()` → 等 5 秒 → mDNS 发现 → 端口扫描兜底 → `switchToPort(targetPort)`
 
@@ -343,6 +353,7 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 | 未过期 | 继续每分钟轮询 |
 | 用户运行中修改超时时间 | 下次轮询自动读取新值，无需重启线程 |
 | 用户关闭再启用 ADB | `adb_enabled_at` 刷新，监控线程按新时间判断 |
+| 超时后用户点保存 | `refresh_adb=true`，`adb_enabled_at` 刷新，监控线程重新启动 |
 
 监控线程靠 `expiryMonitorRunning` 标志防重复启动。每次服务启动时若 `shouldEnableAdb()` 为 true，调用 `startExpiryMonitor()`，已运行则直接返回。
 
@@ -354,6 +365,7 @@ adb -s 机顶盒IP:端口 install -r app-release.apk
 - **release 签名**：`app/build.gradle.kts` 已内置环境变量方式，需生成 `app/keystore.jks` 并设置 `KEYSTORE_FILE`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD` 四个环境变量。
 - **versionCode 默认值**：已改为 `306`，高于设备上已装版本的 `305`，避免降级安装失败。
 - **无线调试端口机制**：无线调试启动后 adbd 监听随机端口，targetPort（如 45555）需要 `tcpip:<targetPort>` 切换后才会监听。“ADB启用”打开后必须触发一次端口切换，否则 targetPort 长期不可用。
+- **超时后恢复**：超时后 adbd 被关闭，`adb_enabled` 仍为 true。用户在 Web 页面点“保存”，`refresh_adb` 因 `expired=true` 被置为 true，触发重新计时并启用，不会死锁。
 - **开机后 targetPort 可用时间**：开机流程 `configureAdb()` 包含 60 秒 WiFi 等待 + 30 秒稳定等待 + 15 秒等 adbd + mDNS/扫描 + 切换，顺利路径约 60~90 秒，mDNS 失败时更长。这是原项目设计，未修改。
 - **安装报错处理**：
   - `INSTALL_FAILED_VERSION_DOWNGRADE`：调大 versionCode 默认值后重新编译安装。

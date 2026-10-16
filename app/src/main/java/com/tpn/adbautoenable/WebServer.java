@@ -96,82 +96,98 @@ public class WebServer extends NanoHTTPD {
         }
     }
 
-    private Response handleSaveSettings(IHTTPSession session) {
-        try {
-            Map<String, String> files = new HashMap<>();
-            session.parseBody(files);
-            Map<String, List<String>> params = session.getParameters();
+	private Response handleSaveSettings(IHTTPSession session) {
+		try {
+			Map<String, String> files = new HashMap<>();
+			session.parseBody(files);
+			Map<String, List<String>> params = session.getParameters();
 
-            SharedPreferences prefs = getPrefs();
+			SharedPreferences prefs = getPrefs();
 
-            // 记录旧凭证，用于判断是否变化
-            String oldUsername = prefs.getString("web_username", "admin");
-            String oldPassword = prefs.getString("web_password", "admin");
-            // 记录旧的 adb_enabled，用于判断是否从关到开
-            boolean oldEnabled = prefs.getBoolean("adb_enabled", true);
+			// 记录旧凭证，用于判断是否变化
+			String oldUsername = prefs.getString("web_username", "admin");
+			String oldPassword = prefs.getString("web_password", "admin");
+			// 记录旧的 adb_enabled，用于判断是否从关到开
+			boolean oldEnabled = prefs.getBoolean("adb_enabled", true);
 
-            SharedPreferences.Editor editor = prefs.edit();
+			SharedPreferences.Editor editor = prefs.edit();
 
-            editor.putBoolean("adb_enabled", params.containsKey("adb_enabled"));
+			editor.putBoolean("adb_enabled", params.containsKey("adb_enabled"));
 
-            List<String> expList = params.get("adb_expiry_minutes");
-            if (expList != null && !expList.isEmpty()) {
-                try {
-                    int m = Integer.parseInt(expList.get(0));
-                    editor.putInt("adb_expiry_minutes", Math.max(1, Math.min(4320, m)));
-                } catch (NumberFormatException ignored) {}
-            }
+			List<String> expList = params.get("adb_expiry_minutes");
+			if (expList != null && !expList.isEmpty()) {
+				try {
+					int m = Integer.parseInt(expList.get(0));
+					editor.putInt("adb_expiry_minutes", Math.max(1, Math.min(4320, m)));
+				} catch (NumberFormatException ignored) {}
+			}
 
-            List<String> userList = params.get("web_username");
-            if (userList != null && !userList.isEmpty() && !userList.get(0).isEmpty()) {
-                editor.putString("web_username", userList.get(0));
-            }
+			List<String> userList = params.get("web_username");
+			if (userList != null && !userList.isEmpty() && !userList.get(0).isEmpty()) {
+				editor.putString("web_username", userList.get(0));
+			}
 
-            List<String> passList = params.get("web_password");
-            if (passList != null && !passList.isEmpty() && !passList.get(0).isEmpty()) {
-                editor.putString("web_password", passList.get(0));
-            }
+			List<String> passList = params.get("web_password");
+			if (passList != null && !passList.isEmpty() && !passList.get(0).isEmpty()) {
+				editor.putString("web_password", passList.get(0));
+			}
 
-            editor.apply();
-            Log.i(TAG, "Web API: settings saved");
+			editor.apply();
+			Log.i(TAG, "Web API: settings saved");
 
-            // 判断 adb_enabled 是否从关到开
-            boolean newEnabled = prefs.getBoolean("adb_enabled", true);
-            boolean enableTransition = !oldEnabled && newEnabled;
+			// 判断是否需要刷新 adb_enabled_at
+			boolean newEnabled = prefs.getBoolean("adb_enabled", true);
+			// 条件 1：从关到开
+			boolean enableTransition = !oldEnabled && newEnabled;
 
-            // 只有从关闭变为开启，才触发重新计时
-            Intent intent = new Intent(context, AdbConfigService.class);
-            intent.putExtra("refresh_adb", enableTransition);
-            context.startForegroundService(intent);
+			// 条件 2：已超时且仍启用（用户点保存即视为重新启用）
+			boolean expired = false;
+			if (newEnabled) {
+				long enabledAt = prefs.getLong("adb_enabled_at", 0);
+				int expiryMinutes = prefs.getInt("adb_expiry_minutes", 1440);
+				if (enabledAt > 0) {
+					long elapsed = (System.currentTimeMillis() - enabledAt) / 60000;
+					expired = elapsed >= expiryMinutes;
+				}
+			}
 
-            // 判断凭证是否变化
-            String newUsername = prefs.getString("web_username", "admin");
-            String newPassword = prefs.getString("web_password", "admin");
-            boolean credentialsChanged =
-                    !oldUsername.equals(newUsername) || !oldPassword.equals(newPassword);
+			boolean refresh = enableTransition || expired;
+			Log.i(TAG, "Web API: refresh_adb=" + refresh
+					+ " (enableTransition=" + enableTransition
+					+ ", expired=" + expired + ")");
 
-            if (credentialsChanged) {
-                // 凭证变了，返回 401，浏览器立刻弹登录框
-                Log.i(TAG, "Web API: credentials changed, requesting re-auth");
-                Response resp = newFixedLengthResponse(
-                        Response.Status.UNAUTHORIZED, "text/plain",
-                        "凭证已修改，请重新登录");
-                resp.addHeader("WWW-Authenticate", "Basic realm=\"ADB Auto-Enable\"");
-                return resp;
-            }
+			Intent intent = new Intent(context, AdbConfigService.class);
+			intent.putExtra("refresh_adb", refresh);
+			context.startForegroundService(intent);
 
-            // 凭证没变，正常跳回首页
-            Response resp = newFixedLengthResponse(
-                    Response.Status.REDIRECT, "text/plain", "");
-            resp.addHeader("Location", "/");
-            return resp;
-        } catch (Exception e) {
-            Log.e(TAG, "Web API: save settings error", e);
-            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR,
-                    "application/json", "{\"error\":\"" + e.getMessage() + "\"}");
-        }
-    }
+			// 判断凭证是否变化
+			String newUsername = prefs.getString("web_username", "admin");
+			String newPassword = prefs.getString("web_password", "admin");
+			boolean credentialsChanged =
+					!oldUsername.equals(newUsername) || !oldPassword.equals(newPassword);
 
+			if (credentialsChanged) {
+				// 凭证变了，返回 401，浏览器立刻弹登录框
+				Log.i(TAG, "Web API: credentials changed, requesting re-auth");
+				Response resp = newFixedLengthResponse(
+						Response.Status.UNAUTHORIZED, "text/plain",
+						"凭证已修改，请重新登录");
+				resp.addHeader("WWW-Authenticate", "Basic realm=\"ADB Auto-Enable\"");
+				return resp;
+			}
+
+			// 凭证没变，正常跳回首页
+			Response resp = newFixedLengthResponse(
+					Response.Status.REDIRECT, "text/plain", "");
+			resp.addHeader("Location", "/");
+			return resp;
+		} catch (Exception e) {
+			Log.e(TAG, "Web API: save settings error", e);
+			return newFixedLengthResponse(Response.Status.INTERNAL_ERROR,
+					"application/json", "{\"error\":\"" + e.getMessage() + "\"}");
+		}
+	}
+	
     private Response handleToggleWebServer(IHTTPSession session) {
         try {
             Map<String, String> files = new HashMap<>();
