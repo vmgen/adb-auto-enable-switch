@@ -101,6 +101,9 @@ public class WebServer extends NanoHTTPD {
 			Map<String, String> files = new HashMap<>();
 			session.parseBody(files);
 			Map<String, List<String>> params = session.getParameters();
+			
+			Log.i(TAG, "handleSaveSettings params=" + params);
+            Log.i(TAG, "handleSaveSettings postData=" + files.get("postData"));
 
 			SharedPreferences prefs = getPrefs();
 

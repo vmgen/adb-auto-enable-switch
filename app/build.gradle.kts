@@ -1,3 +1,6 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     id("com.android.application")
 }
@@ -5,7 +8,7 @@ plugins {
 android {
     namespace = "com.tpn.adbautoenable"
     compileSdk = 35
-	base.archivesName.set("adb-auto-enable-switch-app")
+	base.archivesName.set("adb-auto-switch")
 
     defaultConfig {
         applicationId = "com.tpn.adbautoenable"
@@ -36,7 +39,7 @@ android {
             signingConfig = signingConfigs.getByName("release")
         }
     }
-
+	
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
@@ -52,4 +55,15 @@ dependencies {
     implementation(libs.androidx.annotation)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20250517")
+}
+
+tasks.whenTaskAdded {
+    if (name == "assembleRelease") {
+        doLast {
+            val ts = SimpleDateFormat("yyyyMMddHHmm").format(Date())
+            val dir = layout.buildDirectory.dir("outputs/apk/release").get().asFile
+            dir.listFiles()?.firstOrNull { it.name.endsWith(".apk") && !it.name.contains("unsigned") }
+                ?.renameTo(File(dir, "adb-auto-switch-${ts}.apk"))
+        }
+    }
 }

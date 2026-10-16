@@ -117,7 +117,8 @@ public class AdbConfigService extends Service {
             Bundle extras = intent.getExtras();
             if (extras != null) {
                 for (String key : extras.keySet()) {
-                    Log.i(TAG, "Extra: " + key + " = " + extras.getString(key));
+                    // 用 get() 而非 getString()，避免 boolean extra 打印成 null
+                    Log.i(TAG, "Extra: " + key + " = " + extras.get(key));
                 }
             } else {
                 Log.i(TAG, "Intent has no extras");
@@ -154,6 +155,7 @@ public class AdbConfigService extends Service {
             ensureTclAutostartProtectionAsync();
 
             boolean refreshAdb = intent != null && intent.getBooleanExtra("refresh_adb", false);
+            Log.i(TAG, "refreshAdb=" + refreshAdb);
 
             // 启用/禁用 adbd；refreshAdb=true 时刷新 adb_enabled_at，否则保留旧计时
             enableWirelessDebuggingImmediately(refreshAdb);
@@ -273,6 +275,19 @@ public class AdbConfigService extends Service {
 
     private void enableWirelessDebuggingImmediately(boolean refreshTimer) {
         try {
+            SharedPreferences prefs = getPrefs();
+            long enabledAt = prefs.getLong("adb_enabled_at", 0);
+
+            // 先处理刷新：明确要求刷新，或首次无值时，刷新时间戳
+            if (refreshTimer || enabledAt == 0) {
+                prefs.edit()
+                        .putLong("adb_enabled_at", System.currentTimeMillis())
+                        .apply();
+                Log.i(TAG, "adb_enabled_at refreshed (refreshTimer=" + refreshTimer
+                        + ", enabledAt=" + enabledAt + ")");
+            }
+
+            // 再判断是否应该启用
             if (!shouldEnableAdb()) {
                 Log.i(TAG, "ADB disabled or expired, setting adb_wifi_enabled=0");
                 Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
@@ -282,20 +297,6 @@ public class AdbConfigService extends Service {
             Log.i(TAG, "Enabling wireless debugging & disabling key revocation...");
             Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
             Settings.Global.putLong(getContentResolver(), "adb_allowed_connection_time", 0L);
-
-            // 只在用户主动启用，或首次无值时刷新起始时间戳
-            SharedPreferences prefs = getPrefs();
-            long enabledAt = prefs.getLong("adb_enabled_at", 0);
-            if (refreshTimer || enabledAt == 0) {
-                prefs.edit()
-                        .putLong("adb_enabled_at", System.currentTimeMillis())
-                        .apply();
-                Log.i(TAG, "adb_enabled_at refreshed (refreshTimer=" + refreshTimer
-                        + ", enabledAt=" + enabledAt + ")");
-            } else {
-                long elapsedMinutes = (System.currentTimeMillis() - enabledAt) / 60000;
-                Log.i(TAG, "adb_enabled_at unchanged (elapsed " + elapsedMinutes + " min)");
-            }
         } catch (SecurityException e) {
             Log.e(TAG, "Settings write failed - WRITE_SECURE_SETTINGS missing", e);
         } catch (Exception e) {
